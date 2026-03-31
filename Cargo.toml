@@ -1,0 +1,13 @@
+[package]
+name = "dxdwm"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+license-file = "LICENSE"
+description = "A small X11 window manager in Rust"
+
+[dependencies]
+x11rb = { version = "0.13", default-features = false, features = ["xkb"] }
+
+
+
