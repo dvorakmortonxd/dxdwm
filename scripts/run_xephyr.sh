@@ -4,6 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DISPLAY_NUM=":2"
 
+if [ -z "${DISPLAY:-}" ]; then
+  echo "Host DISPLAY is not set. Start this from an active X11 session (for example, a terminal inside your desktop session)."
+  exit 1
+fi
+
 if ! command -v Xephyr >/dev/null 2>&1; then
   echo "Xephyr not found. Install xorg-server-xephyr first."
   exit 1
