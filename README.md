@@ -10,6 +10,10 @@
   - `rofi -show drun`
 - Terminal keybind: **Alt+Enter** runs:
   - `alacritty`
+- Window control keybinds:
+  - `Alt+Q` closes the focused window.
+  - `Alt+W` cycles focus through managed windows (tab-like).
+  - `Alt+Space` toggles between floating mode and single-window tabbed mode.
 - Mouse bindings:
   - `Alt + Left Mouse Drag` moves windows.
   - `Alt + Right Mouse Drag` resizes windows.
@@ -27,6 +31,7 @@
 - `rofi` must be installed and in `PATH` for the launcher binding.
 - `DXDWM_LAUNCHER` can override launcher command (default: `rofi -show drun`).
 - `DXDWM_TERMINAL` can override terminal command (default: `alacritty`).
+- On startup, dxdwm runs `$HOME/.config/dxdwm/dxdwm.sh`; it is auto-created if missing.
 
 ## License
 

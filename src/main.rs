@@ -1,15 +1,19 @@
 use std::collections::HashSet;
 use std::env;
 use std::error::Error;
+use std::fs;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
     ButtonIndex, ButtonPressEvent, ButtonReleaseEvent, ChangeWindowAttributesAux,
-    ConfigWindow, ConfigureRequestEvent, ConfigureWindowAux, ConnectionExt, EventMask,
-    GrabMode, InputFocus, KeyPressEvent, MapRequestEvent, ModMask, MotionNotifyEvent, StackMode,
-    UnmapNotifyEvent, Window,
+    ClientMessageData, ClientMessageEvent, ConfigWindow, ConfigureRequestEvent,
+    ConfigureWindowAux, ConnectionExt, EventMask, GrabMode, InputFocus, KeyPressEvent,
+    MapRequestEvent, ModMask, MotionNotifyEvent, StackMode, UnmapNotifyEvent, Window,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::{CURRENT_TIME, NONE};
@@ -17,8 +21,17 @@ use x11rb::{CURRENT_TIME, NONE};
 const KEYSYM_SUPER_L: u32 = 0xFFEB;
 const KEYSYM_SUPER_R: u32 = 0xFFEC;
 const KEYSYM_RETURN: u32 = 0xFF0D;
+const KEYSYM_Q: u32 = 0x0071;
+const KEYSYM_W: u32 = 0x0077;
+const KEYSYM_SPACE: u32 = 0x0020;
 const KEYSYM_NUM_LOCK: u32 = 0xFF7F;
 const MIN_WIN_SIZE: u16 = 64;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LayoutMode {
+    Floating,
+    Tabbed,
+}
 
 #[derive(Clone, Copy)]
 enum DragMode {
@@ -44,7 +57,13 @@ struct Wm {
     managed: HashSet<Window>,
     super_keycodes: Vec<u8>,
     terminal_keycodes: Vec<u8>,
+    close_keycodes: Vec<u8>,
+    cycle_keycodes: Vec<u8>,
+    toggle_mode_keycodes: Vec<u8>,
     num_lock_mask: u16,
+    managed_order: Vec<Window>,
+    focused: Option<Window>,
+    layout_mode: LayoutMode,
     drag: Option<DragState>,
 }
 
@@ -84,7 +103,13 @@ impl Wm {
             managed: HashSet::new(),
             super_keycodes: Vec::new(),
             terminal_keycodes: Vec::new(),
+            close_keycodes: Vec::new(),
+            cycle_keycodes: Vec::new(),
+            toggle_mode_keycodes: Vec::new(),
             num_lock_mask: 0,
+            managed_order: Vec::new(),
+            focused: None,
+            layout_mode: LayoutMode::Floating,
             drag: None,
         };
 
@@ -104,7 +129,7 @@ impl Wm {
                 x11rb::protocol::Event::UnmapNotify(e) => self.on_unmap(e),
                 x11rb::protocol::Event::DestroyNotify(e) => self.on_unmanage(e.window),
                 x11rb::protocol::Event::ConfigureRequest(e) => self.on_configure_request(e)?,
-                x11rb::protocol::Event::KeyPress(e) => self.on_key_press(e),
+                x11rb::protocol::Event::KeyPress(e) => self.on_key_press(e)?,
                 x11rb::protocol::Event::ButtonPress(e) => self.on_button_press(e)?,
                 x11rb::protocol::Event::MotionNotify(e) => self.on_motion(e)?,
                 x11rb::protocol::Event::ButtonRelease(e) => self.on_button_release(e)?,
@@ -142,6 +167,9 @@ impl Wm {
 
         self.super_keycodes = self.keycodes_for_keysyms(&[KEYSYM_SUPER_L, KEYSYM_SUPER_R])?;
         self.terminal_keycodes = self.keycodes_for_keysyms(&[KEYSYM_RETURN])?;
+        self.close_keycodes = self.keycodes_for_keysyms(&[KEYSYM_Q])?;
+        self.cycle_keycodes = self.keycodes_for_keysyms(&[KEYSYM_W])?;
+        self.toggle_mode_keycodes = self.keycodes_for_keysyms(&[KEYSYM_SPACE])?;
 
         for keycode in &self.super_keycodes {
             for mods in self.modifier_variants(ModMask::from(0u16)) {
@@ -157,6 +185,45 @@ impl Wm {
         }
 
         for keycode in &self.terminal_keycodes {
+            for mods in self.modifier_variants(ModMask::M1) {
+                self.conn.grab_key(
+                    false,
+                    self.root,
+                    mods,
+                    *keycode,
+                    GrabMode::ASYNC,
+                    GrabMode::ASYNC,
+                )?;
+            }
+        }
+
+        for keycode in &self.close_keycodes {
+            for mods in self.modifier_variants(ModMask::M1) {
+                self.conn.grab_key(
+                    false,
+                    self.root,
+                    mods,
+                    *keycode,
+                    GrabMode::ASYNC,
+                    GrabMode::ASYNC,
+                )?;
+            }
+        }
+
+        for keycode in &self.cycle_keycodes {
+            for mods in self.modifier_variants(ModMask::M1) {
+                self.conn.grab_key(
+                    false,
+                    self.root,
+                    mods,
+                    *keycode,
+                    GrabMode::ASYNC,
+                    GrabMode::ASYNC,
+                )?;
+            }
+        }
+
+        for keycode in &self.toggle_mode_keycodes {
             for mods in self.modifier_variants(ModMask::M1) {
                 self.conn.grab_key(
                     false,
@@ -248,6 +315,7 @@ impl Wm {
         self.conn.map_window(e.window)?;
         self.manage_window(e.window)?;
         self.focus(e.window)?;
+        self.apply_layout()?;
         Ok(())
     }
 
@@ -259,9 +327,15 @@ impl Wm {
 
     fn on_unmanage(&mut self, window: Window) {
         self.managed.remove(&window);
+        self.managed_order.retain(|w| *w != window);
+        if self.focused == Some(window) {
+            self.focused = self.managed_order.last().copied();
+        }
         if matches!(self.drag, Some(d) if d.window == window) {
             self.drag = None;
         }
+
+        let _ = self.apply_layout();
     }
 
     fn on_configure_request(&self, e: ConfigureRequestEvent) -> Result<(), Box<dyn Error>> {
@@ -292,7 +366,7 @@ impl Wm {
         Ok(())
     }
 
-    fn on_key_press(&self, e: KeyPressEvent) {
+    fn on_key_press(&mut self, e: KeyPressEvent) -> Result<(), Box<dyn Error>> {
         let state_bits = self.normalize_modifiers(u16::from(e.state));
 
         if self.terminal_keycodes.contains(&e.detail)
@@ -301,7 +375,24 @@ impl Wm {
             if let Err(err) = spawn_terminal() {
                 eprintln!("failed to launch terminal: {err}");
             }
-            return;
+            return Ok(());
+        }
+
+        if self.close_keycodes.contains(&e.detail) && (state_bits & u16::from(ModMask::M1)) != 0 {
+            self.close_focused_window()?;
+            return Ok(());
+        }
+
+        if self.cycle_keycodes.contains(&e.detail) && (state_bits & u16::from(ModMask::M1)) != 0 {
+            self.focus_next_window()?;
+            return Ok(());
+        }
+
+        if self.toggle_mode_keycodes.contains(&e.detail)
+            && (state_bits & u16::from(ModMask::M1)) != 0
+        {
+            self.toggle_layout_mode()?;
+            return Ok(());
         }
 
         if self.super_keycodes.contains(&e.detail) && state_bits == 0 {
@@ -309,9 +400,15 @@ impl Wm {
                 eprintln!("failed to launch rofi: {err}");
             }
         }
+
+        Ok(())
     }
 
     fn on_button_press(&mut self, e: ButtonPressEvent) -> Result<(), Box<dyn Error>> {
+        if self.layout_mode == LayoutMode::Tabbed {
+            return Ok(());
+        }
+
         let is_alt = u16::from(e.state) & u16::from(ModMask::M1) != 0;
         if !is_alt {
             return Ok(());
@@ -434,16 +531,137 @@ impl Wm {
         }
 
         self.managed.insert(window);
+        if !self.managed_order.contains(&window) {
+            self.managed_order.push(window);
+        }
         Ok(())
     }
 
-    fn focus(&self, window: Window) -> Result<(), Box<dyn Error>> {
+    fn focus(&mut self, window: Window) -> Result<(), Box<dyn Error>> {
+        if let Some(pos) = self.managed_order.iter().position(|w| *w == window) {
+            let w = self.managed_order.remove(pos);
+            self.managed_order.push(w);
+        }
+        self.focused = Some(window);
+
         self.conn
             .set_input_focus(InputFocus::POINTER_ROOT, window, CURRENT_TIME)?;
         self.conn.configure_window(
             window,
             &ConfigureWindowAux::default().stack_mode(StackMode::ABOVE),
         )?;
+        Ok(())
+    }
+
+    fn close_focused_window(&self) -> Result<(), Box<dyn Error>> {
+        let Some(window) = self.focused else {
+            return Ok(());
+        };
+
+        let wm_protocols = self
+            .conn
+            .intern_atom(false, b"WM_PROTOCOLS")?
+            .reply()?
+            .atom;
+        let wm_delete_window = self
+            .conn
+            .intern_atom(false, b"WM_DELETE_WINDOW")?
+            .reply()?
+            .atom;
+
+        let protocols = self
+            .conn
+            .get_property(false, window, wm_protocols, x11rb::NONE, 0, u32::MAX)?
+            .reply()?;
+
+        let supports_delete = protocols
+            .value32()
+            .map(|atoms| atoms.into_iter().any(|atom| atom == wm_delete_window))
+            .unwrap_or(false);
+
+        if supports_delete {
+            let data = ClientMessageData::from([wm_delete_window, CURRENT_TIME, 0, 0, 0]);
+            let event = ClientMessageEvent::new(32, window, wm_protocols, data);
+            self.conn.send_event(false, window, EventMask::NO_EVENT, event)?;
+        } else {
+            self.conn.kill_client(window)?;
+        }
+
+        Ok(())
+    }
+
+    fn focus_next_window(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.managed_order.is_empty() {
+            return Ok(());
+        }
+
+        let next_window = match self.focused {
+            Some(current) => {
+                let idx = self
+                    .managed_order
+                    .iter()
+                    .position(|w| *w == current)
+                    .unwrap_or(0);
+                let next_idx = (idx + 1) % self.managed_order.len();
+                self.managed_order[next_idx]
+            }
+            None => self.managed_order[0],
+        };
+
+        self.focus(next_window)?;
+        self.apply_layout()?;
+        Ok(())
+    }
+
+    fn toggle_layout_mode(&mut self) -> Result<(), Box<dyn Error>> {
+        self.layout_mode = match self.layout_mode {
+            LayoutMode::Floating => LayoutMode::Tabbed,
+            LayoutMode::Tabbed => LayoutMode::Floating,
+        };
+        self.apply_layout()?;
+        Ok(())
+    }
+
+    fn apply_layout(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.managed_order.is_empty() {
+            self.focused = None;
+            return Ok(());
+        }
+
+        if self.focused.is_none() {
+            self.focused = self.managed_order.last().copied();
+        }
+
+        match self.layout_mode {
+            LayoutMode::Floating => {
+                for window in &self.managed_order {
+                    let _ = self.conn.map_window(*window);
+                }
+            }
+            LayoutMode::Tabbed => {
+                let focused = self.focused.unwrap_or(self.managed_order[0]);
+                let root_geom = self.conn.get_geometry(self.root)?.reply()?;
+
+                for window in &self.managed_order {
+                    if *window == focused {
+                        let _ = self.conn.map_window(*window);
+                        self.conn.configure_window(
+                            *window,
+                            &ConfigureWindowAux::default()
+                                .x(0)
+                                .y(0)
+                                .width(u32::from(root_geom.width))
+                                .height(u32::from(root_geom.height)),
+                        )?;
+                    } else {
+                        let _ = self.conn.unmap_window(*window);
+                    }
+                }
+
+                self.focus(focused)?;
+            }
+        }
+
         Ok(())
     }
 }
@@ -481,8 +699,39 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn Error>> {
     ensure_display_set()?;
+    ensure_and_run_startup_script()?;
     let mut wm = Wm::new()?;
     wm.run()
+}
+
+fn ensure_and_run_startup_script() -> Result<(), Box<dyn Error>> {
+    let home = env::var("HOME").map_err(|_| io::Error::other("HOME is not set"))?;
+    let config_dir = PathBuf::from(home).join(".config/dxdwm");
+    let script_path = config_dir.join("dxdwm.sh");
+
+    fs::create_dir_all(&config_dir)?;
+
+    if !script_path.exists() {
+        fs::write(
+            &script_path,
+            "#!/usr/bin/env sh\n# dxdwm startup hook\n# Add your startup apps here, one per line.\n\n",
+        )?;
+    }
+
+    #[cfg(unix)]
+    {
+        let perms = fs::Permissions::from_mode(0o755);
+        fs::set_permissions(&script_path, perms)?;
+    }
+
+    Command::new("sh")
+        .arg(script_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    Ok(())
 }
 
 fn ensure_display_set() -> Result<(), Box<dyn Error>> {
