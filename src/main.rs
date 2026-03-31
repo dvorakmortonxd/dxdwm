@@ -1,5 +1,7 @@
 use std::collections::HashSet;
+use std::env;
 use std::error::Error;
+use std::io;
 use std::process::{Command, Stdio};
 
 use x11rb::connection::Connection;
@@ -15,7 +17,6 @@ use x11rb::{CURRENT_TIME, NONE};
 
 const KEYSYM_SUPER_L: u32 = 0xFFEB;
 const KEYSYM_SUPER_R: u32 = 0xFFEC;
-const KEYSYM_RETURN: u32 = 0xFF0D;
 const MIN_WIN_SIZE: u16 = 64;
 
 #[derive(Clone, Copy)]
@@ -41,13 +42,21 @@ struct Wm {
     root: Window,
     managed: HashSet<Window>,
     super_keycodes: Vec<u8>,
-    alt_enter_keycodes: Vec<u8>,
     drag: Option<DragState>,
 }
 
 impl Wm {
     fn new() -> Result<Self, Box<dyn Error>> {
-        let (conn, screen_num) = x11rb::connect(None)?;
+        let display = env::var("DISPLAY")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "unset".to_string());
+
+        let (conn, screen_num) = x11rb::connect(None).map_err(|err| {
+            io::Error::other(format!(
+                "Failed to connect to X server using DISPLAY={display}. Original error: {err}"
+            ))
+        })?;
         let root = conn.setup().roots[screen_num].root;
 
         conn.change_window_attributes(
@@ -71,12 +80,10 @@ impl Wm {
             root,
             managed: HashSet::new(),
             super_keycodes: Vec::new(),
-            alt_enter_keycodes: Vec::new(),
             drag: None,
         };
 
         wm.grab_super_key()?;
-        wm.grab_alt_enter()?;
         wm.take_existing_windows()?;
         wm.advertise_wm_selection()?;
         wm.conn.flush()?;
@@ -214,48 +221,7 @@ impl Wm {
             if let Err(err) = spawn_rofi() {
                 eprintln!("failed to launch rofi: {err}");
             }
-            return;
         }
-
-        let is_alt = u16::from(e.state) & u16::from(ModMask::M1) != 0;
-        if is_alt && self.alt_enter_keycodes.contains(&e.detail) {
-            if let Err(err) = spawn_alacritty() {
-                eprintln!("failed to launch alacritty: {err}");
-            }
-        }
-    }
-
-    fn grab_alt_enter(&mut self) -> Result<(), Box<dyn Error>> {
-        let mapping = self.conn.get_keyboard_mapping(8, 248)?.reply()?;
-
-        for (idx, syms) in mapping
-            .keysyms
-            .chunks(mapping.keysyms_per_keycode as usize)
-            .enumerate()
-        {
-            if syms.iter().any(|s| *s == KEYSYM_RETURN) {
-                let keycode = (idx + 8) as u8;
-                self.alt_enter_keycodes.push(keycode);
-
-                for mods in [
-                    ModMask::M1,
-                    ModMask::M1 | ModMask::LOCK,
-                    ModMask::M1 | ModMask::M2,
-                    ModMask::M1 | ModMask::M2 | ModMask::LOCK,
-                ] {
-                    self.conn.grab_key(
-                        false,
-                        self.root,
-                        mods,
-                        keycode,
-                        GrabMode::ASYNC,
-                        GrabMode::ASYNC,
-                    )?;
-                }
-            }
-        }
-
-        Ok(())
     }
 
     fn on_button_press(&mut self, e: ButtonPressEvent) -> Result<(), Box<dyn Error>> {
@@ -411,17 +377,6 @@ fn spawn_rofi() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn spawn_alacritty() -> Result<(), Box<dyn Error>> {
-    Command::new("sh")
-        .arg("-c")
-        .arg("alacritty")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    Ok(())
-}
-
 fn main() {
     if let Err(err) = run() {
         eprintln!("dxdwm exited with error: {err}");
@@ -430,8 +385,24 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
+    ensure_display_set()?;
     let mut wm = Wm::new()?;
     wm.run()
+}
+
+fn ensure_display_set() -> Result<(), Box<dyn Error>> {
+    let display_is_set = env::var("DISPLAY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+
+    if !display_is_set {
+        return Err(io::Error::other(
+            "DISPLAY is not set. Start this inside an X11 session or use scripts/run_xephyr.sh from an existing X session.",
+        )
+        .into());
+    }
+
+    Ok(())
 }
 
 
