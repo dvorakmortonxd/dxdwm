@@ -12,11 +12,12 @@ use x11rb::protocol::xproto::{
     UnmapNotifyEvent, Window,
 };
 use x11rb::rust_connection::RustConnection;
-use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 use x11rb::{CURRENT_TIME, NONE};
 
 const KEYSYM_SUPER_L: u32 = 0xFFEB;
 const KEYSYM_SUPER_R: u32 = 0xFFEC;
+const KEYSYM_RETURN: u32 = 0xFF0D;
+const KEYSYM_NUM_LOCK: u32 = 0xFF7F;
 const MIN_WIN_SIZE: u16 = 64;
 
 #[derive(Clone, Copy)]
@@ -42,6 +43,8 @@ struct Wm {
     root: Window,
     managed: HashSet<Window>,
     super_keycodes: Vec<u8>,
+    terminal_keycodes: Vec<u8>,
+    num_lock_mask: u16,
     drag: Option<DragState>,
 }
 
@@ -80,10 +83,12 @@ impl Wm {
             root,
             managed: HashSet::new(),
             super_keycodes: Vec::new(),
+            terminal_keycodes: Vec::new(),
+            num_lock_mask: 0,
             drag: None,
         };
 
-        wm.grab_super_key()?;
+        wm.setup_input_grabs()?;
         wm.take_existing_windows()?;
         wm.advertise_wm_selection()?;
         wm.conn.flush()?;
@@ -132,40 +137,111 @@ impl Wm {
         Ok(())
     }
 
-    fn grab_super_key(&mut self) -> Result<(), Box<dyn Error>> {
+    fn setup_input_grabs(&mut self) -> Result<(), Box<dyn Error>> {
+        self.num_lock_mask = self.detect_num_lock_mask()?;
+
+        self.super_keycodes = self.keycodes_for_keysyms(&[KEYSYM_SUPER_L, KEYSYM_SUPER_R])?;
+        self.terminal_keycodes = self.keycodes_for_keysyms(&[KEYSYM_RETURN])?;
+
+        for keycode in &self.super_keycodes {
+            for mods in self.modifier_variants(ModMask::from(0u16)) {
+                self.conn.grab_key(
+                    false,
+                    self.root,
+                    mods,
+                    *keycode,
+                    GrabMode::ASYNC,
+                    GrabMode::ASYNC,
+                )?;
+            }
+        }
+
+        for keycode in &self.terminal_keycodes {
+            for mods in self.modifier_variants(ModMask::M1) {
+                self.conn.grab_key(
+                    false,
+                    self.root,
+                    mods,
+                    *keycode,
+                    GrabMode::ASYNC,
+                    GrabMode::ASYNC,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn keycodes_for_keysyms(&self, keysyms: &[u32]) -> Result<Vec<u8>, Box<dyn Error>> {
         let mapping = self.conn.get_keyboard_mapping(8, 248)?.reply()?;
+        let mut keycodes = Vec::new();
 
         for (idx, syms) in mapping
             .keysyms
             .chunks(mapping.keysyms_per_keycode as usize)
             .enumerate()
         {
-            if syms
-                .iter()
-                .any(|s| *s == KEYSYM_SUPER_L || *s == KEYSYM_SUPER_R)
-            {
-                let keycode = (idx + 8) as u8;
-                self.super_keycodes.push(keycode);
+            if syms.iter().any(|s| keysyms.contains(s)) {
+                keycodes.push((idx + 8) as u8);
+            }
+        }
 
-                for mods in [
-                    ModMask::M4,
-                    ModMask::M4 | ModMask::LOCK,
-                    ModMask::M4 | ModMask::M2,
-                    ModMask::M4 | ModMask::M2 | ModMask::LOCK,
-                ] {
-                    self.conn.grab_key(
-                        false,
-                        self.root,
-                        mods,
-                        keycode,
-                        GrabMode::ASYNC,
-                        GrabMode::ASYNC,
-                    )?;
+        Ok(keycodes)
+    }
+
+    fn detect_num_lock_mask(&self) -> Result<u16, Box<dyn Error>> {
+        let modifier_map = self.conn.get_modifier_mapping()?.reply()?;
+        let keycodes_per_modifier = modifier_map.keycodes_per_modifier() as usize;
+        let modifier_masks = [
+            u16::from(ModMask::SHIFT),
+            u16::from(ModMask::LOCK),
+            u16::from(ModMask::CONTROL),
+            u16::from(ModMask::M1),
+            u16::from(ModMask::M2),
+            u16::from(ModMask::M3),
+            u16::from(ModMask::M4),
+            u16::from(ModMask::M5),
+        ];
+
+        for (idx, mask_bits) in modifier_masks.iter().copied().enumerate() {
+            let start = idx * keycodes_per_modifier;
+            let end = start + keycodes_per_modifier;
+            for keycode in &modifier_map.keycodes[start..end] {
+                if *keycode == 0 {
+                    continue;
+                }
+
+                let reply = self.conn.get_keyboard_mapping(*keycode, 1)?.reply()?;
+                if reply.keysyms.contains(&KEYSYM_NUM_LOCK) {
+                    return Ok(mask_bits);
                 }
             }
         }
 
-        Ok(())
+        Ok(0)
+    }
+
+    fn modifier_variants(&self, base: ModMask) -> Vec<ModMask> {
+        let base_bits = u16::from(base);
+        let lock_bits = u16::from(ModMask::LOCK);
+        let mut variants = vec![
+            ModMask::from(base_bits),
+            ModMask::from(base_bits | lock_bits),
+        ];
+        if self.num_lock_mask != 0 {
+            variants.push(ModMask::from(base_bits | self.num_lock_mask));
+            variants.push(ModMask::from(base_bits | self.num_lock_mask | lock_bits));
+        }
+        variants.sort_by_key(|mask| u16::from(*mask));
+        variants.dedup_by_key(|mask| u16::from(*mask));
+        variants
+    }
+
+    fn normalize_modifiers(&self, state_bits: u16) -> u16 {
+        let mut bits = state_bits;
+        bits &= !u16::from(ModMask::LOCK);
+        bits &= !self.num_lock_mask;
+        bits
     }
 
     fn on_map_request(&mut self, e: MapRequestEvent) -> Result<(), Box<dyn Error>> {
@@ -217,7 +293,18 @@ impl Wm {
     }
 
     fn on_key_press(&self, e: KeyPressEvent) {
-        if self.super_keycodes.contains(&e.detail) {
+        let state_bits = self.normalize_modifiers(u16::from(e.state));
+
+        if self.terminal_keycodes.contains(&e.detail)
+            && (state_bits & u16::from(ModMask::M1)) != 0
+        {
+            if let Err(err) = spawn_terminal() {
+                eprintln!("failed to launch terminal: {err}");
+            }
+            return;
+        }
+
+        if self.super_keycodes.contains(&e.detail) && state_bits == 0 {
             if let Err(err) = spawn_rofi() {
                 eprintln!("failed to launch rofi: {err}");
             }
@@ -321,12 +408,7 @@ impl Wm {
         }
 
         // Passive grabs allow Alt+Button drag even when focus is elsewhere.
-        for mods in [
-            ModMask::M1,
-            ModMask::M1 | ModMask::LOCK,
-            ModMask::M1 | ModMask::M2,
-            ModMask::M1 | ModMask::M2 | ModMask::LOCK,
-        ] {
+        for mods in self.modifier_variants(ModMask::M1) {
             self.conn.grab_button(
                 false,
                 window,
@@ -367,9 +449,22 @@ impl Wm {
 }
 
 fn spawn_rofi() -> Result<(), Box<dyn Error>> {
+    let launcher = env::var("DXDWM_LAUNCHER").unwrap_or_else(|_| "rofi -show drun".to_string());
     Command::new("sh")
         .arg("-c")
-        .arg("rofi -show drun")
+        .arg(launcher)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
+fn spawn_terminal() -> Result<(), Box<dyn Error>> {
+    let terminal = env::var("DXDWM_TERMINAL").unwrap_or_else(|_| "alacritty".to_string());
+    Command::new("sh")
+        .arg("-c")
+        .arg(terminal)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
